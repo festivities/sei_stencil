@@ -18,6 +18,52 @@ bl_info = {
 IMAGE_NAME = '_SSTENCIL'
 DEBUG_MODE = True
 
+class SEI_PG_stencil_collection(bpy.types.PropertyGroup):
+    collection: bpy.props.PointerProperty(
+        type=bpy.types.Collection,
+        name='Collection',
+        description='Collection for stencil layer'
+    )
+    layer: bpy.props.IntProperty(
+        default=1,
+        min=0,
+        max=255,
+        name='Layer',
+        description='Layer value (0-255)'
+    )
+
+class SEI_OT_stencil_collection_add(bpy.types.Operator):
+    bl_idname = 'sei.stencil_collection_add'
+    bl_label = 'Add Stencil Collection'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        context.scene.collection_sstencils.add()
+        context.scene.active_sstencil_index = len(context.scene.collection_sstencils) - 1
+        return {'FINISHED'}
+
+class SEI_OT_stencil_collection_remove(bpy.types.Operator):
+    bl_idname = 'sei.stencil_collection_remove'
+    bl_label = 'Remove Stencil Collection'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        if scene.collection_sstencils:
+            scene.collection_sstencils.remove(scene.active_sstencil_index)
+            if scene.active_sstencil_index > 0:
+                scene.active_sstencil_index -= 1
+        return {'FINISHED'}
+
+class SEI_UL_stencil_collections(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            layout.prop(item, 'collection', text='')
+            layout.prop(item, 'layer', text='Layer')
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            layout.label(text='', icon='OUTLINER_COLLECTION')
+
 class SEI_OT_view3d_stencil_visualizer(bpy.types.Operator):
     bl_idname = 'sei.view3d_stencil_visualizer'
     bl_label = 'Visualize Stencil'
@@ -41,34 +87,17 @@ class SEI_OT_view3d_stencil_visualizer(bpy.types.Operator):
     def _setup_shader(self):
         vsh = \
         '''
-        /*
-        in vec3 position;
-        in vec4 vertex_colour;
-
-        out vec3 vcol;
-
-        uniform mat4 viewproj_matrix;
-        uniform mat4 obj_matrix;
-        */
-
         void main()
         {
             gl_Position = viewproj_matrix * obj_matrix * vec4(position, 1.0);
-            vcol = vertex_colour.rgb;
         }
         '''
 
         fsh = \
         '''
-        /*
-        in vec3 vcol;
-
-        out vec4 col0;
-        */
-
         void main()
         {
-            col0 = vec4(vcol, 1.0);
+            col0 = layer_color;
         }
         '''
 
@@ -79,15 +108,11 @@ class SEI_OT_view3d_stencil_visualizer(bpy.types.Operator):
 
         # vsh attributes
         shader_info.vertex_in(0, 'VEC3', 'position')
-        shader_info.vertex_in(1, 'VEC4', 'vertex_colour')
-
-        interface_info = gpu.types.GPUStageInterfaceInfo("attrs_out")
-        interface_info.smooth('VEC3', 'vcol')
-        shader_info.vertex_out(interface_info)
 
         # uniforms
         shader_info.push_constant('MAT4', 'viewproj_matrix')
         shader_info.push_constant('MAT4', 'obj_matrix')
+        shader_info.push_constant('VEC4', 'layer_color')
 
         # write
         shader_info.fragment_out(0, 'VEC4', 'col0')
@@ -98,71 +123,50 @@ class SEI_OT_view3d_stencil_visualizer(bpy.types.Operator):
         scene = context.scene
         depsgraph = context.evaluated_depsgraph_get()
 
-        coll = scene.collection_sstencil
-
-        if coll is None:
+        if len(scene.collection_sstencils) == 0:
             return
 
-        batches_matrices = []
+        batches_matrices_layer = []
 
-        for obj in coll.all_objects:
-            if obj.type != 'MESH' \
-            or obj.visible_get() is False:
+        for sstencil in scene.collection_sstencils:
+            coll = sstencil.collection
+            layer_val = sstencil.layer / 255.0
+
+            if coll is None:
                 continue
 
-            # TODO: Use CBlenderMalt for better performance.
-            mesh = obj.evaluated_get(depsgraph).data
+            for obj in coll.all_objects:
+                if obj.type != 'MESH' \
+                or obj.visible_get() is False:
+                    continue
 
-            if mesh is None \
-            or len(mesh.polygons) < 1:
-                continue
+                # TODO: Use CBlenderMalt for better performance.
+                mesh = obj.evaluated_get(depsgraph).data
 
-            vcol = mesh.attributes.get(mesh.attributes.default_color_name)
+                if mesh is None \
+                or len(mesh.polygons) < 1:
+                    continue
 
-            if vcol is None:
                 vertices = np.empty((len(mesh.vertices), 3), 'f')
                 indices = np.empty((len(mesh.loop_triangles), 3), 'i')
-                colours = np.ones((len(mesh.vertices), 3), 'f') # white
 
                 mesh.vertices.foreach_get('co', vertices.ravel())
                 mesh.loop_triangles.foreach_get('vertices', indices.ravel())
 
-            elif vcol.domain == 'POINT':
-                vertices = np.empty((len(mesh.vertices), 3), 'f')
-                indices = np.empty((len(mesh.loop_triangles), 3), 'i')
-                colours = np.empty((len(vcol.data), 4), 'f')
+                vbo_format = gpu.types.GPUVertFormat()
+                vbo_format.attr_add(
+                    id='position', comp_type='F32', len=len(vertices[0]), fetch_mode='FLOAT')
 
-                mesh.vertices.foreach_get('co', vertices.ravel())
-                mesh.loop_triangles.foreach_get('vertices', indices.ravel())
-                vcol.data.foreach_get('color', colours.ravel())
+                vbo = gpu.types.GPUVertBuf(vbo_format, len(vertices))
+                vbo.attr_fill('position', vertices)
 
-            elif vcol.domain == 'CORNER':
-                vertices = np.empty((len(mesh.vertices), 3), 'f')
-                indices = np.empty((len(mesh.loop_triangles), 3), 'i')
-                colours = np.empty((len(vcol.data), 4), 'f')
+                ibo = gpu.types.GPUIndexBuf(type='TRIS', seq=indices)
 
-                mesh.vertices.foreach_get('co', vertices.ravel())
-                mesh.loop_triangles.foreach_get('loops', indices.ravel())
-                vcol.data.foreach_get('color', colours.ravel())
-
-                vertices = vertices[[l.vertex_index for l in mesh.loops]]
-
-            vbo_format = gpu.types.GPUVertFormat()
-            vbo_format.attr_add(
-                id='position', comp_type='F32', len=len(vertices[0]), fetch_mode='FLOAT')
-            vbo_format.attr_add(
-                id='vertex_colour', comp_type='F32', len=len(colours[0]), fetch_mode='FLOAT')
-
-            vbo = gpu.types.GPUVertBuf(vbo_format, len(vertices))
-            vbo.attr_fill('position', vertices)
-            vbo.attr_fill('vertex_colour', colours)
-
-            ibo = gpu.types.GPUIndexBuf(type='TRIS', seq=indices)
-
-            batches_matrices.append((
-                gpu.types.GPUBatch(type='TRIS', buf=vbo, elem=ibo),
-                obj.matrix_world
-            ))
+                batches_matrices_layer.append((
+                    gpu.types.GPUBatch(type='TRIS', buf=vbo, elem=ibo),
+                    obj.matrix_world,
+                    (layer_val, layer_val, layer_val, 1.0)
+                ))
 
         if context and context.region_data.view_perspective != 'CAMERA':
             _, _, width, height = gpu.state.viewport_get()
@@ -192,8 +196,9 @@ class SEI_OT_view3d_stencil_visualizer(bpy.types.Operator):
 
             shader.uniform_float('viewproj_matrix', matrix)
 
-            for batch, obj_matrix in batches_matrices:
+            for batch, obj_matrix, layer_color in batches_matrices_layer:
                 shader.uniform_float('obj_matrix', obj_matrix)
+                shader.uniform_float('layer_color', layer_color)
                 batch.draw(shader)
 
             buffer = framebuffer.read_color(0, 0, width, height, 4, 0, 'FLOAT')
@@ -210,8 +215,7 @@ class SEI_OT_view3d_stencil_visualizer(bpy.types.Operator):
         return \
         context.area \
         and context.area.type == 'VIEW_3D' \
-        and context.scene.collection_sstencil \
-        and context.scene.collection_sstencil.all_objects
+        and len(context.scene.collection_sstencils) > 0
 
     def execute(self, context):
         if SEI_OT_view3d_stencil_visualizer._handle:
@@ -248,9 +252,7 @@ class SEI_OT_stencil_render(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return \
-        context.scene.collection_sstencil \
-        and context.scene.collection_sstencil.all_objects
+        return len(context.scene.collection_sstencils) > 0
 
     def execute(self, context):
         def print_message(message: str="") -> None:
@@ -263,6 +265,7 @@ class SEI_OT_stencil_render(bpy.types.Operator):
         _saved_attrs_objects = []
         _saved_attrs_render = []
         _saved_attrs_nodes = []
+        _saved_obj_colors = []
 
         _tmp_filepath = ''
         _tmp_image = None
@@ -270,13 +273,25 @@ class SEI_OT_stencil_render(bpy.types.Operator):
         scene = context.scene
 
         #########
-        # Verify collection.
+        # Gather all stencil objects and set visibility.
+        print_message('Gathering stencil objects.')
 
-        # NOTE: poll() takes care of it.
-        coll = scene.collection_sstencil
+        all_stencil_objs = set()
+        for sstencil in scene.collection_sstencils:
+            coll = sstencil.collection
+            if coll is None:
+                continue
+            coll.hide_render = False
+            layer_val = sstencil.layer / 255.0
+            for obj in coll.all_objects:
+                if obj.type == 'MESH' and obj not in all_stencil_objs:
+                    all_stencil_objs.add(obj)
+                    _saved_obj_colors.append((obj, tuple(obj.color)))
+                    obj.color = (layer_val, layer_val, layer_val, 1.0)
 
-        # TODO: Return if collection_layer.exclude.
-        coll.hide_render = False
+        if not all_stencil_objs:
+            self.report({'WARNING'}, 'No stencil objects found in collections.')
+            return {'FINISHED'}
 
         #########
         # Get and hide non stencil objects attributes.
@@ -285,7 +300,7 @@ class SEI_OT_stencil_render(bpy.types.Operator):
         for obj in scene.objects:
             if obj.type == 'CAMERA' \
             or obj.hide_render is True \
-            or obj.name in coll.all_objects:
+            or obj in all_stencil_objs:
                 continue
 
             # Save and set.
@@ -319,10 +334,15 @@ class SEI_OT_stencil_render(bpy.types.Operator):
             self.report({'WARNING'}, f'No nodes were found with the image named "{IMAGE_NAME}".')
 
             # Restore the attributes.
-            coll.hide_render = True
+            for sstencil in scene.collection_sstencils:
+                if sstencil.collection:
+                    sstencil.collection.hide_render = True
 
             for obj, value in _saved_attrs_objects:
                 obj.hide_render = value
+
+            for obj, color in _saved_obj_colors:
+                obj.color = color
 
             return {'FINISHED'}
 
@@ -367,7 +387,7 @@ class SEI_OT_stencil_render(bpy.types.Operator):
             (scene.grease_pencil_settings, 'antialias_threshold', 1.0),
 
             (scene.display.shading, 'light', 'FLAT'),
-            (scene.display.shading, 'color_type', 'VERTEX'),
+            (scene.display.shading, 'color_type', 'OBJECT'),
             (scene.display.shading, 'show_backface_culling', False),
             (scene.display.shading, 'show_xray', False),
             (scene.display.shading, 'show_shadows', False),
@@ -411,10 +431,15 @@ class SEI_OT_stencil_render(bpy.types.Operator):
         # Restore the attributes.
         print_message('Restoring the attributes.')
 
-        coll.hide_render = True
+        for sstencil in scene.collection_sstencils:
+            if sstencil.collection:
+                sstencil.collection.hide_render = True
 
         for obj, value in _saved_attrs_objects:
             obj.hide_render = value
+
+        for obj, color in _saved_obj_colors:
+            obj.color = color
 
         # NOTE: reversed() restores dependant attributes
         # (e.g., PNG vs. OPEN_EXR) in the correct order.
@@ -521,7 +546,22 @@ class SEI_PT_stencil(bpy.types.Panel):
         layout.use_property_decorate = False  # No animation.
 
         col = layout.column()
-        col.prop(context.scene, 'collection_sstencil')
+        
+        # UIList for stencil collections
+        row = col.row()
+        row.template_list(
+            'SEI_UL_stencil_collections',
+            'stencil_collections',
+            context.scene,
+            'collection_sstencils',
+            context.scene,
+            'active_sstencil_index'
+        )
+        
+        col_buttons = row.column(align=True)
+        col_buttons.operator('sei.stencil_collection_add', icon='ADD', text='')
+        col_buttons.operator('sei.stencil_collection_remove', icon='REMOVE', text='')
+        
         col.operator(
             'sei.view3d_stencil_visualizer',
             text = 'Visualize',
@@ -543,6 +583,10 @@ class SEI_PT_stencil(bpy.types.Panel):
 # ===========================
 
 classes = [
+    SEI_PG_stencil_collection,
+    SEI_OT_stencil_collection_add,
+    SEI_OT_stencil_collection_remove,
+    SEI_UL_stencil_collections,
     SEI_OT_view3d_stencil_visualizer,
     SEI_OT_stencil_render,
     SEI_PT_stencil
@@ -552,17 +596,23 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
 
-    bpy.types.Scene.collection_sstencil = bpy.props.PointerProperty(
-        type = bpy.types.Collection,
-        name = 'Collection',
-        description = 'Collection to retrieve objects'
+    bpy.types.Scene.collection_sstencils = bpy.props.CollectionProperty(
+        type=SEI_PG_stencil_collection,
+        name='Stencil Collections'
+    )
+    
+    bpy.types.Scene.active_sstencil_index = bpy.props.IntProperty(
+        default=0,
+        min=0,
+        name='Active Stencil Index'
     )
 
 def unregister():
     for cls in classes:
         bpy.utils.unregister_class(cls)
 
-    del bpy.types.Scene.collection_sstencil
+    del bpy.types.Scene.collection_sstencils
+    del bpy.types.Scene.active_sstencil_index
 
 if __name__ == "__main__": # debug; live edit
     register()
