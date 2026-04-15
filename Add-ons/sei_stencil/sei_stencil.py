@@ -662,11 +662,6 @@ class SEI_OT_stencil_render(bpy.types.Operator):
         self.report({'INFO'}, 'Successfully rendered the image(s).')
         return {'FINISHED'}
 
-    def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self)
-
-    def draw(self, context):
-        self.layout.prop(self, 'render_image') # RENDER_STILL
 
 class SEI_PT_stencil(bpy.types.Panel):
     bl_space_type = 'VIEW_3D'
@@ -717,9 +712,14 @@ class SEI_PT_stencil(bpy.types.Panel):
         )
         col.operator(
             'sei.stencil_render',
+            text = 'Render Image',
+            icon = 'RENDER_STILL'
+        ).render_image = True
+        col.operator(
+            'sei.stencil_render',
             text = 'Render Animation',
             icon = 'RENDER_ANIMATION'
-        )
+        ).render_image = False
 
         layout.separator()
 
