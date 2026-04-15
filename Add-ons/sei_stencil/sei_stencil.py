@@ -139,15 +139,22 @@ def find_layer_collection(layer_coll, target_collection):
             return result
     return None
 
-def build_batches_for_collections(collections, depsgraph):
-    """Build GPU batches for all mesh objects in the given collections."""
+def build_batches_for_collections(collections, depsgraph, for_render=False):
+    """Build GPU batches for all mesh objects in the given collections.
+    When for_render=True, checks hide_render instead of viewport visibility."""
     batches_matrices = []
 
     for coll in collections:
         for obj in coll.all_objects:
-            if obj.type != 'MESH' \
-            or obj.visible_get() is False:
+            if obj.type != 'MESH':
                 continue
+
+            if for_render:
+                if obj.hide_render:
+                    continue
+            else:
+                if obj.visible_get() is False:
+                    continue
 
             # TODO: Use CBlenderMalt for better performance.
             mesh = obj.evaluated_get(depsgraph).data
@@ -205,6 +212,114 @@ def build_batches_for_collections(collections, depsgraph):
 
     return batches_matrices
 
+def create_stencil_shader():
+    """Create the GPU shader used for stencil rendering."""
+    vsh = \
+    '''
+    /*
+    in vec3 position;
+    in vec4 vertex_colour;
+
+    out vec3 vcol;
+
+    uniform mat4 viewproj_matrix;
+    uniform mat4 obj_matrix;
+    */
+
+    void main()
+    {
+        gl_Position = viewproj_matrix * obj_matrix * vec4(position, 1.0);
+        vcol = vertex_colour.rgb;
+    }
+    '''
+
+    fsh = \
+    '''
+    /*
+    in vec3 vcol;
+
+    out vec4 col0;
+    */
+
+    void main()
+    {
+        col0 = vec4(vcol, 1.0);
+    }
+    '''
+
+    shader_info = gpu.types.GPUShaderCreateInfo()
+
+    shader_info.vertex_source(vsh)
+    shader_info.fragment_source(fsh)
+
+    # vsh attributes
+    shader_info.vertex_in(0, 'VEC3', 'position')
+    shader_info.vertex_in(1, 'VEC4', 'vertex_colour')
+
+    interface_info = gpu.types.GPUStageInterfaceInfo("attrs_out")
+    interface_info.smooth('VEC3', 'vcol')
+    shader_info.vertex_out(interface_info)
+
+    # uniforms
+    shader_info.push_constant('MAT4', 'viewproj_matrix')
+    shader_info.push_constant('MAT4', 'obj_matrix')
+
+    # write
+    shader_info.fragment_out(0, 'VEC4', 'col0')
+
+    return gpu.shader.create_from_info(shader_info)
+
+def render_stencil_offscreen(shader, width, height, matrix,
+                             batches_matrices, holdout_batches):
+    """Render a stencil pass to a GPU offscreen buffer.
+    Returns the pixel buffer as a flat float array."""
+    offscreen = gpu.types.GPUOffScreen(width, height, format='RGBA8')
+
+    with offscreen.bind():
+        framebuffer = gpu.state.active_framebuffer_get()
+        framebuffer.clear(color=(0.0, 0.0, 0.0, 0.0), depth=1.0)
+
+        gpu.state.depth_mask_set(True)
+        gpu.state.depth_test_set('LESS')
+        gpu.state.blend_set('NONE')
+
+        shader.uniform_float('viewproj_matrix', matrix)
+
+        # Render holdout objects first (writes depth only).
+        # Their color output is discarded by the color clear below.
+        if holdout_batches:
+            for batch, obj_matrix in holdout_batches:
+                shader.uniform_float('obj_matrix', obj_matrix)
+                batch.draw(shader)
+
+            # Clear color but keep the depth buffer intact.
+            # Stencil objects will now fail the depth test
+            # wherever holdout geometry is in front.
+            framebuffer.clear(color=(0.0, 0.0, 0.0, 0.0))
+
+        for batch, obj_matrix in batches_matrices:
+            shader.uniform_float('obj_matrix', obj_matrix)
+            batch.draw(shader)
+
+        buffer = framebuffer.read_color(0, 0, width, height, 4, 0, 'FLOAT')
+        buffer.dimensions = width * height * 4
+
+    offscreen.free()
+    return buffer
+
+def save_buffer_as_exr(buffer, width, height, filepath):
+    """Save a GPU pixel buffer to an EXR file."""
+    tmp_img = bpy.data.images.new(
+        '_tmp_stencil_save', width, height,
+        alpha=True, float_buffer=True)
+    try:
+        tmp_img.pixels.foreach_set(buffer)
+        tmp_img.file_format = 'OPEN_EXR'
+        tmp_img.filepath_raw = filepath
+        tmp_img.save()
+    finally:
+        bpy.data.images.remove(tmp_img)
+
 # ===========================
 # Operators
 # ===========================
@@ -233,61 +348,6 @@ class SEI_OT_view3d_stencil_visualizer(bpy.types.Operator):
 
         return images
 
-    def _setup_shader(self):
-        vsh = \
-        '''
-        /*
-        in vec3 position;
-        in vec4 vertex_colour;
-
-        out vec3 vcol;
-
-        uniform mat4 viewproj_matrix;
-        uniform mat4 obj_matrix;
-        */
-
-        void main()
-        {
-            gl_Position = viewproj_matrix * obj_matrix * vec4(position, 1.0);
-            vcol = vertex_colour.rgb;
-        }
-        '''
-
-        fsh = \
-        '''
-        /*
-        in vec3 vcol;
-
-        out vec4 col0;
-        */
-
-        void main()
-        {
-            col0 = vec4(vcol, 1.0);
-        }
-        '''
-
-        shader_info = gpu.types.GPUShaderCreateInfo()
-
-        shader_info.vertex_source(vsh)
-        shader_info.fragment_source(fsh)
-
-        # vsh attributes
-        shader_info.vertex_in(0, 'VEC3', 'position')
-        shader_info.vertex_in(1, 'VEC4', 'vertex_colour')
-
-        interface_info = gpu.types.GPUStageInterfaceInfo("attrs_out")
-        interface_info.smooth('VEC3', 'vcol')
-        shader_info.vertex_out(interface_info)
-
-        # uniforms
-        shader_info.push_constant('MAT4', 'viewproj_matrix')
-        shader_info.push_constant('MAT4', 'obj_matrix')
-
-        # write
-        shader_info.fragment_out(0, 'VEC4', 'col0')
-
-        return gpu.shader.create_from_info(shader_info)
 
     def draw_stencil(self, context, shader, images):
         scene = context.scene
@@ -330,38 +390,9 @@ class SEI_OT_view3d_stencil_visualizer(bpy.types.Operator):
             holdout_batches = build_batches_for_collections(
                 holdout_colls, depsgraph) if holdout_colls else []
 
-            offscreen = gpu.types.GPUOffScreen(width, height, format='RGBA8')
-
-            with offscreen.bind():
-                framebuffer = gpu.state.active_framebuffer_get()
-                framebuffer.clear(color=(0.0, 0.0, 0.0, 0.0), depth=1.0)
-
-                gpu.state.depth_mask_set(True)
-                gpu.state.depth_test_set('LESS')
-                gpu.state.blend_set('NONE')
-
-                shader.uniform_float('viewproj_matrix', matrix)
-
-                # Render holdout objects first (writes depth only).
-                # Their color output is discarded by the color clear below.
-                if holdout_batches:
-                    for batch, obj_matrix in holdout_batches:
-                        shader.uniform_float('obj_matrix', obj_matrix)
-                        batch.draw(shader)
-
-                    # Clear color but keep the depth buffer intact.
-                    # Stencil objects will now fail the depth test
-                    # wherever holdout geometry is in front.
-                    framebuffer.clear(color=(0.0, 0.0, 0.0, 0.0))
-
-                for batch, obj_matrix in batches_matrices:
-                    shader.uniform_float('obj_matrix', obj_matrix)
-                    batch.draw(shader)
-
-                buffer = framebuffer.read_color(0, 0, width, height, 4, 0, 'FLOAT')
-                buffer.dimensions = width * height * 4
-
-            offscreen.free()
+            buffer = render_stencil_offscreen(
+                shader, width, height, matrix,
+                batches_matrices, holdout_batches)
 
             image.scale(width, height)
             image.pixels.foreach_set(buffer)
@@ -384,7 +415,7 @@ class SEI_OT_view3d_stencil_visualizer(bpy.types.Operator):
 
         else:
             images = self._setup_images()
-            shader = self._setup_shader()
+            shader = create_stencil_shader()
 
             SEI_OT_view3d_stencil_visualizer._handle = \
             bpy.types.SpaceView3D.draw_handler_add(
@@ -418,7 +449,6 @@ class SEI_OT_stencil_render(bpy.types.Operator):
 
         #########
         # Initialize values.
-        _saved_attrs_render = []
         _saved_attrs_nodes = []
 
         _tmp_filepaths = {}
@@ -435,6 +465,8 @@ class SEI_OT_stencil_render(bpy.types.Operator):
         if not pass_collections:
             self.report({'WARNING'}, 'No collections assigned to stencil passes.')
             return {'FINISHED'}
+
+        pass_holdouts = get_pass_holdouts(scene)
 
         #########
         # Get the image nodes for each pass.
@@ -483,7 +515,6 @@ class SEI_OT_stencil_render(bpy.types.Operator):
 
         org_filepath = bpy.path.abspath(scene.render.filepath)
 
-        # TODO: bpy.ops.render.render() creates the filepath.
         if os.path.exists(org_filepath) is False:
             os.makedirs(org_filepath, exist_ok=True)
 
@@ -493,157 +524,63 @@ class SEI_OT_stencil_render(bpy.types.Operator):
         del org_filepath
 
         #########
-        # Get and set the render attributes.
-        print_message('Get and set the render attributes.')
+        # Render stencil images using GPU offscreen.
+        # This uses the same depth-buffer holdout trick
+        # as the viewport visualizer.
+        print_message('Rendering stencil passes (GPU offscreen).')
 
-        # NOTE: A dictionary added unecessary complexity.
-        attrs_render = [
-            (scene.render, 'engine', 'BLENDER_WORKBENCH'),
-            (scene.render, 'use_simplify', False),
-            (scene.render, 'film_transparent', True),
-            (scene.render, 'use_freestyle', False),
-            (scene.render, 'use_compositing', False),
-            (scene.render, 'use_sequencer', False),
-            (scene.render, 'use_file_extension', True),
-            (scene.render, 'use_render_cache', False),
-            (scene.render, 'use_overwrite', True),
-            (scene.render, 'use_placeholder', False),
+        shader = create_stencil_shader()
 
-            (scene.display, 'render_aa', '8'),
+        width  = scene.render.resolution_x \
+                 * scene.render.resolution_percentage // 100
+        height = scene.render.resolution_y \
+                 * scene.render.resolution_percentage // 100
 
-            (scene.grease_pencil_settings, 'antialias_threshold', 1.0),
+        if self.render_image:
+            frames = [scene.frame_current]
+        else:
+            frames = range(scene.frame_start, scene.frame_end + 1)
 
-            (scene.display.shading, 'light', 'FLAT'),
-            (scene.display.shading, 'color_type', 'VERTEX'),
-            (scene.display.shading, 'show_backface_culling', False),
-            (scene.display.shading, 'show_xray', False),
-            (scene.display.shading, 'show_shadows', False),
-            (scene.display.shading, 'show_cavity', False),
-            (scene.display.shading, 'use_dof', False),
-            (scene.display.shading, 'show_object_outline', False),
+        _saved_frame = scene.frame_current
 
-            (scene.display_settings, 'display_device', 'sRGB'),
-
-            (scene.render.image_settings.view_settings, 'view_transform', 'Standard'),
-            (scene.render.image_settings.view_settings, 'look', 'None'),
-            (scene.render.image_settings.view_settings, 'exposure', 0.0),
-            (scene.render.image_settings.view_settings, 'gamma', 1.0),
-            (scene.render.image_settings.view_settings, 'use_curve_mapping', False),
-            (scene.render.image_settings.view_settings, 'use_white_balance', False),
-
-            (scene.render.image_settings, 'file_format', 'OPEN_EXR'), # order matters
-            (scene.render.image_settings, 'color_mode', 'RGBA'),
-            (scene.render.image_settings, 'color_depth', '16'),
-            (scene.render.image_settings, 'exr_codec', 'ZIP')
-        ]
-
-        # Save and set.
-        for obj, attr, value in attrs_render:
-            if hasattr(obj, attr):
-                _saved_attrs_render.append((obj, attr, getattr(obj, attr)))
-                setattr(obj, attr, value)
-
-        del attrs_render
-
-        # Save filepath separately since it changes per pass.
-        _saved_filepath = scene.render.filepath
-
-        # Group holdout collections by stencil pass.
-        pass_holdouts = get_pass_holdouts(scene)
-
-        #########
-        # Render stencil images for each active pass.
         for pass_idx in active_passes:
             collections = pass_collections[pass_idx]
             holdout_colls = pass_holdouts.get(pass_idx, [])
-            print_message(f'Rendering stencil pass {pass_idx}.')
 
-            # Unhide the stencil collections for this pass.
-            saved_coll_hide = []
-            for coll in collections:
-                saved_coll_hide.append((coll, coll.hide_render))
-                # TODO: Return if collection_layer.exclude.
-                coll.hide_render = False
-
-            # Unhide holdout collections and mark as holdout
-            # in the view layer so Workbench renders them as
-            # transparent holes (with film_transparent = True).
-            saved_holdout_state = []
-            for h_coll in holdout_colls:
-                saved_coll_hide.append((h_coll, h_coll.hide_render))
-                h_coll.hide_render = False
-
-                layer_coll = find_layer_collection(
-                    context.view_layer.layer_collection, h_coll)
-                if layer_coll:
-                    saved_holdout_state.append((
-                        layer_coll,
-                        layer_coll.holdout,
-                        layer_coll.exclude
-                    ))
-                    layer_coll.holdout = True
-                    layer_coll.exclude = False
-
-            # Get the set of object names in this pass's collections
-            # (stencil + holdout) to keep them visible.
-            pass_obj_names = set()
-            for coll in collections:
-                for obj in coll.all_objects:
-                    pass_obj_names.add(obj.name)
-            for h_coll in holdout_colls:
-                for obj in h_coll.all_objects:
-                    pass_obj_names.add(obj.name)
-
-            # Get and hide non stencil objects for this pass.
-            saved_obj_hide = []
-            for obj in scene.objects:
-                if obj.type == 'CAMERA' \
-                or obj.hide_render is True \
-                or obj.name in pass_obj_names:
-                    continue
-
-                # Save and set.
-                saved_obj_hide.append((obj, obj.hide_render))
-                obj.hide_render = True
-
-            # Set filepath for this pass.
             _tmp_filepath = os.path.join(
                 directory, f'_tmp_sstencil_{pass_idx}') + os.sep
             os.makedirs(_tmp_filepath, exist_ok=True)
-            scene.render.filepath = _tmp_filepath
             _tmp_filepaths[pass_idx] = _tmp_filepath
 
-            # Render (stencil images).
-            print_message(f'Rendering the stencil images for pass {pass_idx}.')
+            for frame in frames:
+                print_message(
+                    f'Rendering stencil pass {pass_idx}, frame {frame}.')
 
-            if self.render_image:
-                bpy.ops.render.render(write_still=True, use_viewport=True)
-            else:
-                bpy.ops.render.render(animation=True, use_viewport=True)
+                scene.frame_set(frame)
+                depsgraph = context.evaluated_depsgraph_get()
 
-            # Restore holdout state.
-            for layer_coll, holdout_val, exclude_val in saved_holdout_state:
-                layer_coll.holdout = holdout_val
-                layer_coll.exclude = exclude_val
+                matrix = \
+                scene.camera.calc_matrix_camera(
+                    depsgraph, x=width, y=height) \
+                @ scene.camera.matrix_world.inverted()
 
-            # Restore visibility for this pass.
-            for coll, value in saved_coll_hide:
-                coll.hide_render = value
+                batches = build_batches_for_collections(
+                    collections, depsgraph, for_render=True)
+                holdout = build_batches_for_collections(
+                    holdout_colls, depsgraph,
+                    for_render=True) if holdout_colls else []
 
-            for obj, value in saved_obj_hide:
-                obj.hide_render = value
+                if not batches:
+                    continue
 
-        #########
-        # Restore the render attributes.
-        print_message('Restoring the attributes.')
+                buffer = render_stencil_offscreen(
+                    shader, width, height, matrix, batches, holdout)
 
-        scene.render.filepath = _saved_filepath
+                frame_path = os.path.join(
+                    _tmp_filepath, f'{frame:04d}.exr')
+                save_buffer_as_exr(buffer, width, height, frame_path)
 
-        # NOTE: reversed() restores dependant attributes
-        # (e.g., PNG vs. OPEN_EXR) in the correct order.
-        for obj, attr, value in reversed(_saved_attrs_render):
-            if hasattr(obj, attr):
-                setattr(obj, attr, value)
+        scene.frame_set(_saved_frame)
 
         #########
         # Set the image sequences to the image nodes.
