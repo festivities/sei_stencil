@@ -32,6 +32,11 @@ class SEI_PG_stencil_collection(bpy.types.PropertyGroup):
         name = 'Collection',
         description = 'Collection to retrieve objects from'
     )
+    holdout_collection: bpy.props.PointerProperty(
+        type = bpy.types.Collection,
+        name = 'Holdout',
+        description = 'Collection to use as holdout mask (occludes the main collection)'
+    )
     stencil_pass: bpy.props.IntProperty(
         name = 'Pass',
         description = 'Which stencil pass (0-7) this collection targets',
@@ -103,12 +108,36 @@ def get_pass_collections(scene):
         pass_collections[pass_idx].append(item.collection)
     return pass_collections
 
+def get_pass_holdouts(scene):
+    """Get unique holdout collections per stencil pass.
+    Returns dict: pass_idx -> [holdout_collection, ...]"""
+    pass_holdouts = {}
+    for item in scene.stencil_collections:
+        if item.collection is None or item.holdout_collection is None:
+            continue
+        pass_idx = item.stencil_pass
+        if pass_idx not in pass_holdouts:
+            pass_holdouts[pass_idx] = []
+        if item.holdout_collection not in pass_holdouts[pass_idx]:
+            pass_holdouts[pass_idx].append(item.holdout_collection)
+    return pass_holdouts
+
 def has_any_stencil_objects(scene):
     """Check if any valid collection with objects is assigned."""
     for item in scene.stencil_collections:
         if item.collection and item.collection.all_objects:
             return True
     return False
+
+def find_layer_collection(layer_coll, target_collection):
+    """Recursively find the LayerCollection wrapping target_collection."""
+    if layer_coll.collection == target_collection:
+        return layer_coll
+    for child in layer_coll.children:
+        result = find_layer_collection(child, target_collection)
+        if result is not None:
+            return result
+    return None
 
 def build_batches_for_collections(collections, depsgraph):
     """Build GPU batches for all mesh objects in the given collections."""
@@ -265,6 +294,7 @@ class SEI_OT_view3d_stencil_visualizer(bpy.types.Operator):
         depsgraph = context.evaluated_depsgraph_get()
 
         pass_collections = get_pass_collections(scene)
+        pass_holdouts = get_pass_holdouts(scene)
 
         if not pass_collections:
             return
@@ -295,17 +325,34 @@ class SEI_OT_view3d_stencil_visualizer(bpy.types.Operator):
             if not batches_matrices:
                 continue
 
+            # Build holdout batches for this pass (if any).
+            holdout_colls = pass_holdouts.get(pass_idx, [])
+            holdout_batches = build_batches_for_collections(
+                holdout_colls, depsgraph) if holdout_colls else []
+
             offscreen = gpu.types.GPUOffScreen(width, height, format='RGBA8')
 
             with offscreen.bind():
                 framebuffer = gpu.state.active_framebuffer_get()
-                framebuffer.clear(depth = 1.0)
+                framebuffer.clear(color=(0.0, 0.0, 0.0, 0.0), depth=1.0)
 
                 gpu.state.depth_mask_set(True)
                 gpu.state.depth_test_set('LESS')
                 gpu.state.blend_set('NONE')
 
                 shader.uniform_float('viewproj_matrix', matrix)
+
+                # Render holdout objects first (writes depth only).
+                # Their color output is discarded by the color clear below.
+                if holdout_batches:
+                    for batch, obj_matrix in holdout_batches:
+                        shader.uniform_float('obj_matrix', obj_matrix)
+                        batch.draw(shader)
+
+                    # Clear color but keep the depth buffer intact.
+                    # Stencil objects will now fail the depth test
+                    # wherever holdout geometry is in front.
+                    framebuffer.clear(color=(0.0, 0.0, 0.0, 0.0))
 
                 for batch, obj_matrix in batches_matrices:
                     shader.uniform_float('obj_matrix', obj_matrix)
@@ -501,23 +548,50 @@ class SEI_OT_stencil_render(bpy.types.Operator):
         # Save filepath separately since it changes per pass.
         _saved_filepath = scene.render.filepath
 
+        # Group holdout collections by stencil pass.
+        pass_holdouts = get_pass_holdouts(scene)
+
         #########
         # Render stencil images for each active pass.
         for pass_idx in active_passes:
             collections = pass_collections[pass_idx]
+            holdout_colls = pass_holdouts.get(pass_idx, [])
             print_message(f'Rendering stencil pass {pass_idx}.')
 
-            # Unhide the collections for this pass.
+            # Unhide the stencil collections for this pass.
             saved_coll_hide = []
             for coll in collections:
                 saved_coll_hide.append((coll, coll.hide_render))
                 # TODO: Return if collection_layer.exclude.
                 coll.hide_render = False
 
-            # Get the set of object names in this pass's collections.
+            # Unhide holdout collections and mark as holdout
+            # in the view layer so Workbench renders them as
+            # transparent holes (with film_transparent = True).
+            saved_holdout_state = []
+            for h_coll in holdout_colls:
+                saved_coll_hide.append((h_coll, h_coll.hide_render))
+                h_coll.hide_render = False
+
+                layer_coll = find_layer_collection(
+                    context.view_layer.layer_collection, h_coll)
+                if layer_coll:
+                    saved_holdout_state.append((
+                        layer_coll,
+                        layer_coll.holdout,
+                        layer_coll.exclude
+                    ))
+                    layer_coll.holdout = True
+                    layer_coll.exclude = False
+
+            # Get the set of object names in this pass's collections
+            # (stencil + holdout) to keep them visible.
             pass_obj_names = set()
             for coll in collections:
                 for obj in coll.all_objects:
+                    pass_obj_names.add(obj.name)
+            for h_coll in holdout_colls:
+                for obj in h_coll.all_objects:
                     pass_obj_names.add(obj.name)
 
             # Get and hide non stencil objects for this pass.
@@ -546,6 +620,11 @@ class SEI_OT_stencil_render(bpy.types.Operator):
                 bpy.ops.render.render(write_still=True, use_viewport=True)
             else:
                 bpy.ops.render.render(animation=True, use_viewport=True)
+
+            # Restore holdout state.
+            for layer_coll, holdout_val, exclude_val in saved_holdout_state:
+                layer_coll.holdout = holdout_val
+                layer_coll.exclude = exclude_val
 
             # Restore visibility for this pass.
             for coll, value in saved_coll_hide:
@@ -682,6 +761,14 @@ class SEI_PT_stencil(bpy.types.Panel):
         col = row.column(align=True)
         col.operator('sei.stencil_collection_add', icon='ADD', text='')
         col.operator('sei.stencil_collection_remove', icon='REMOVE', text='')
+
+        # Holdout collection for the active list item.
+        if len(scene.stencil_collections) > 0:
+            idx = scene.stencil_collections_active_index
+            if 0 <= idx < len(scene.stencil_collections):
+                active_item = scene.stencil_collections[idx]
+                col = layout.column()
+                col.prop(active_item, 'holdout_collection')
 
         layout.separator()
 
