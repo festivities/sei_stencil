@@ -6,63 +6,179 @@ import numpy as np
 bl_info = {
     "name": "Sei Stencil",
     "author": "Seilotte",
-    "version": (1, 0, 1),
+    "version": (2, 0, 0),
     "blender": (5, 0, 0),
     "location": "3D View > Properties > Sei",
-    "description": "Creates a stencil pass for the viewport and final render.",
+    "description": "Creates stencil passes for the viewport and final render.",
     "tracker_url": "https://github.com/seilotte/Blender-Stuff/tree/main/Add-ons/sei_stencil",
     "doc_url": "https://github.com/seilotte/Blender-Stuff/issues",
     "category": "Workflow",
 }
 
-IMAGE_NAME = '_SSTENCIL'
+IMAGE_NAME_PREFIX = '_SSTENCIL'
+MAX_STENCIL_PASSES = 8
 DEBUG_MODE = True
+
+def get_image_name(pass_index):
+    return f'{IMAGE_NAME_PREFIX}_{pass_index}'
+
+# ===========================
+# Property Groups
+# ===========================
 
 class SEI_PG_stencil_collection(bpy.types.PropertyGroup):
     collection: bpy.props.PointerProperty(
-        type=bpy.types.Collection,
-        name='Collection',
-        description='Collection for stencil layer'
+        type = bpy.types.Collection,
+        name = 'Collection',
+        description = 'Collection to retrieve objects from'
     )
-    layer: bpy.props.IntProperty(
-        default=1,
-        min=0,
-        max=255,
-        name='Layer',
-        description='Layer value (0-255)'
+    stencil_pass: bpy.props.IntProperty(
+        name = 'Pass',
+        description = 'Which stencil pass (0-7) this collection targets',
+        min = 0, max = MAX_STENCIL_PASSES - 1, default = 0
     )
+
+# ===========================
+# UI List
+# ===========================
+
+class SEI_UL_stencil_collections(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_property, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            row.prop(item, 'collection', text='')
+            row.prop(item, 'stencil_pass', text='Pass')
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            layout.label(text='', icon='OUTLINER_COLLECTION')
+
+# ===========================
+# List Management Operators
+# ===========================
 
 class SEI_OT_stencil_collection_add(bpy.types.Operator):
     bl_idname = 'sei.stencil_collection_add'
     bl_label = 'Add Stencil Collection'
+    bl_description = 'Add a new collection entry to the stencil list'
+
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        context.scene.collection_sstencils.add()
-        context.scene.active_sstencil_index = len(context.scene.collection_sstencils) - 1
+        context.scene.stencil_collections.add()
+        context.scene.stencil_collections_active_index = \
+            len(context.scene.stencil_collections) - 1
         return {'FINISHED'}
 
 class SEI_OT_stencil_collection_remove(bpy.types.Operator):
     bl_idname = 'sei.stencil_collection_remove'
     bl_label = 'Remove Stencil Collection'
+    bl_description = 'Remove the selected collection entry from the stencil list'
+
     bl_options = {'REGISTER', 'UNDO'}
 
+    @classmethod
+    def poll(cls, context):
+        return len(context.scene.stencil_collections) > 0
+
     def execute(self, context):
-        scene = context.scene
-        if scene.collection_sstencils:
-            scene.collection_sstencils.remove(scene.active_sstencil_index)
-            if scene.active_sstencil_index > 0:
-                scene.active_sstencil_index -= 1
+        idx = context.scene.stencil_collections_active_index
+        context.scene.stencil_collections.remove(idx)
+        context.scene.stencil_collections_active_index = max(0, idx - 1)
         return {'FINISHED'}
 
-class SEI_UL_stencil_collections(bpy.types.UIList):
-    def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
-        if self.layout_type in {'DEFAULT', 'COMPACT'}:
-            layout.prop(item, 'collection', text='')
-            layout.prop(item, 'layer', text='Layer')
-        elif self.layout_type == 'GRID':
-            layout.alignment = 'CENTER'
-            layout.label(text='', icon='OUTLINER_COLLECTION')
+# ===========================
+# Helper Functions
+# ===========================
+
+def get_pass_collections(scene):
+    """Group collections by stencil pass index.
+    Returns dict: pass_idx -> [collection, ...]"""
+    pass_collections = {}
+    for item in scene.stencil_collections:
+        if item.collection is None:
+            continue
+        pass_idx = item.stencil_pass
+        if pass_idx not in pass_collections:
+            pass_collections[pass_idx] = []
+        pass_collections[pass_idx].append(item.collection)
+    return pass_collections
+
+def has_any_stencil_objects(scene):
+    """Check if any valid collection with objects is assigned."""
+    for item in scene.stencil_collections:
+        if item.collection and item.collection.all_objects:
+            return True
+    return False
+
+def build_batches_for_collections(collections, depsgraph):
+    """Build GPU batches for all mesh objects in the given collections."""
+    batches_matrices = []
+
+    for coll in collections:
+        for obj in coll.all_objects:
+            if obj.type != 'MESH' \
+            or obj.visible_get() is False:
+                continue
+
+            # TODO: Use CBlenderMalt for better performance.
+            mesh = obj.evaluated_get(depsgraph).data
+
+            if mesh is None \
+            or len(mesh.polygons) < 1:
+                continue
+
+            vcol = mesh.attributes.get(mesh.attributes.default_color_name)
+
+            if vcol is None:
+                vertices = np.empty((len(mesh.vertices), 3), 'f')
+                indices = np.empty((len(mesh.loop_triangles), 3), 'i')
+                colours = np.ones((len(mesh.vertices), 3), 'f') # white
+
+                mesh.vertices.foreach_get('co', vertices.ravel())
+                mesh.loop_triangles.foreach_get('vertices', indices.ravel())
+
+            elif vcol.domain == 'POINT':
+                vertices = np.empty((len(mesh.vertices), 3), 'f')
+                indices = np.empty((len(mesh.loop_triangles), 3), 'i')
+                colours = np.empty((len(vcol.data), 4), 'f')
+
+                mesh.vertices.foreach_get('co', vertices.ravel())
+                mesh.loop_triangles.foreach_get('vertices', indices.ravel())
+                vcol.data.foreach_get('color', colours.ravel())
+
+            elif vcol.domain == 'CORNER':
+                vertices = np.empty((len(mesh.vertices), 3), 'f')
+                indices = np.empty((len(mesh.loop_triangles), 3), 'i')
+                colours = np.empty((len(vcol.data), 4), 'f')
+
+                mesh.vertices.foreach_get('co', vertices.ravel())
+                mesh.loop_triangles.foreach_get('loops', indices.ravel())
+                vcol.data.foreach_get('color', colours.ravel())
+
+                vertices = vertices[[l.vertex_index for l in mesh.loops]]
+
+            vbo_format = gpu.types.GPUVertFormat()
+            vbo_format.attr_add(
+                id='position', comp_type='F32', len=len(vertices[0]), fetch_mode='FLOAT')
+            vbo_format.attr_add(
+                id='vertex_colour', comp_type='F32', len=len(colours[0]), fetch_mode='FLOAT')
+
+            vbo = gpu.types.GPUVertBuf(vbo_format, len(vertices))
+            vbo.attr_fill('position', vertices)
+            vbo.attr_fill('vertex_colour', colours)
+
+            ibo = gpu.types.GPUIndexBuf(type='TRIS', seq=indices)
+
+            batches_matrices.append((
+                gpu.types.GPUBatch(type='TRIS', buf=vbo, elem=ibo),
+                obj.matrix_world
+            ))
+
+    return batches_matrices
+
+# ===========================
+# Operators
+# ===========================
 
 class SEI_OT_view3d_stencil_visualizer(bpy.types.Operator):
     bl_idname = 'sei.view3d_stencil_visualizer'
@@ -73,31 +189,52 @@ class SEI_OT_view3d_stencil_visualizer(bpy.types.Operator):
 
     _handle = None
 
-    def _setup_image(self):
-        if bpy.data.images.get(IMAGE_NAME) is None:
-            bpy.data.images.new(IMAGE_NAME, 8, 8)
+    def _setup_images(self):
+        images = {}
+        for i in range(MAX_STENCIL_PASSES):
+            name = get_image_name(i)
+            if bpy.data.images.get(name) is None:
+                bpy.data.images.new(name, 8, 8)
 
-        image = bpy.data.images[IMAGE_NAME]
-        image.use_fake_user = True
-        image.colorspace_settings.name = 'Non-Color'
-        image.pack()
+            image = bpy.data.images[name]
+            image.use_fake_user = True
+            image.colorspace_settings.name = 'Non-Color'
+            image.pack()
+            images[i] = image
 
-        return image
+        return images
 
     def _setup_shader(self):
         vsh = \
         '''
+        /*
+        in vec3 position;
+        in vec4 vertex_colour;
+
+        out vec3 vcol;
+
+        uniform mat4 viewproj_matrix;
+        uniform mat4 obj_matrix;
+        */
+
         void main()
         {
             gl_Position = viewproj_matrix * obj_matrix * vec4(position, 1.0);
+            vcol = vertex_colour.rgb;
         }
         '''
 
         fsh = \
         '''
+        /*
+        in vec3 vcol;
+
+        out vec4 col0;
+        */
+
         void main()
         {
-            col0 = layer_color;
+            col0 = vec4(vcol, 1.0);
         }
         '''
 
@@ -108,65 +245,29 @@ class SEI_OT_view3d_stencil_visualizer(bpy.types.Operator):
 
         # vsh attributes
         shader_info.vertex_in(0, 'VEC3', 'position')
+        shader_info.vertex_in(1, 'VEC4', 'vertex_colour')
+
+        interface_info = gpu.types.GPUStageInterfaceInfo("attrs_out")
+        interface_info.smooth('VEC3', 'vcol')
+        shader_info.vertex_out(interface_info)
 
         # uniforms
         shader_info.push_constant('MAT4', 'viewproj_matrix')
         shader_info.push_constant('MAT4', 'obj_matrix')
-        shader_info.push_constant('VEC4', 'layer_color')
 
         # write
         shader_info.fragment_out(0, 'VEC4', 'col0')
 
         return gpu.shader.create_from_info(shader_info)
 
-    def draw_stencil(self, context, shader, image):
+    def draw_stencil(self, context, shader, images):
         scene = context.scene
         depsgraph = context.evaluated_depsgraph_get()
 
-        if len(scene.collection_sstencils) == 0:
+        pass_collections = get_pass_collections(scene)
+
+        if not pass_collections:
             return
-
-        batches_matrices_layer = []
-
-        for sstencil in scene.collection_sstencils:
-            coll = sstencil.collection
-            layer_val = sstencil.layer / 255.0
-
-            if coll is None:
-                continue
-
-            for obj in coll.all_objects:
-                if obj.type != 'MESH' \
-                or obj.visible_get() is False:
-                    continue
-
-                # TODO: Use CBlenderMalt for better performance.
-                mesh = obj.evaluated_get(depsgraph).data
-
-                if mesh is None \
-                or len(mesh.polygons) < 1:
-                    continue
-
-                vertices = np.empty((len(mesh.vertices), 3), 'f')
-                indices = np.empty((len(mesh.loop_triangles), 3), 'i')
-
-                mesh.vertices.foreach_get('co', vertices.ravel())
-                mesh.loop_triangles.foreach_get('vertices', indices.ravel())
-
-                vbo_format = gpu.types.GPUVertFormat()
-                vbo_format.attr_add(
-                    id='position', comp_type='F32', len=len(vertices[0]), fetch_mode='FLOAT')
-
-                vbo = gpu.types.GPUVertBuf(vbo_format, len(vertices))
-                vbo.attr_fill('position', vertices)
-
-                ibo = gpu.types.GPUIndexBuf(type='TRIS', seq=indices)
-
-                batches_matrices_layer.append((
-                    gpu.types.GPUBatch(type='TRIS', buf=vbo, elem=ibo),
-                    obj.matrix_world,
-                    (layer_val, layer_val, layer_val, 1.0)
-                ))
 
         if context and context.region_data.view_perspective != 'CAMERA':
             _, _, width, height = gpu.state.viewport_get()
@@ -184,30 +285,39 @@ class SEI_OT_view3d_stencil_visualizer(bpy.types.Operator):
         width  = width * scene.render.resolution_percentage // 100
         height = height * scene.render.resolution_percentage // 100
 
-        offscreen = gpu.types.GPUOffScreen(width, height, format='RGBA8')
+        for pass_idx, collections in pass_collections.items():
+            image = images.get(pass_idx)
+            if image is None:
+                continue
 
-        with offscreen.bind():
-            framebuffer = gpu.state.active_framebuffer_get()
-            framebuffer.clear(depth = 1.0)
+            batches_matrices = build_batches_for_collections(collections, depsgraph)
 
-            gpu.state.depth_mask_set(True)
-            gpu.state.depth_test_set('LESS')
-            gpu.state.blend_set('NONE')
+            if not batches_matrices:
+                continue
 
-            shader.uniform_float('viewproj_matrix', matrix)
+            offscreen = gpu.types.GPUOffScreen(width, height, format='RGBA8')
 
-            for batch, obj_matrix, layer_color in batches_matrices_layer:
-                shader.uniform_float('obj_matrix', obj_matrix)
-                shader.uniform_float('layer_color', layer_color)
-                batch.draw(shader)
+            with offscreen.bind():
+                framebuffer = gpu.state.active_framebuffer_get()
+                framebuffer.clear(depth = 1.0)
 
-            buffer = framebuffer.read_color(0, 0, width, height, 4, 0, 'FLOAT')
-            buffer.dimensions = width * height * 4
+                gpu.state.depth_mask_set(True)
+                gpu.state.depth_test_set('LESS')
+                gpu.state.blend_set('NONE')
 
-        offscreen.free()
+                shader.uniform_float('viewproj_matrix', matrix)
 
-        image.scale(width, height)
-        image.pixels.foreach_set(buffer)
+                for batch, obj_matrix in batches_matrices:
+                    shader.uniform_float('obj_matrix', obj_matrix)
+                    batch.draw(shader)
+
+                buffer = framebuffer.read_color(0, 0, width, height, 4, 0, 'FLOAT')
+                buffer.dimensions = width * height * 4
+
+            offscreen.free()
+
+            image.scale(width, height)
+            image.pixels.foreach_set(buffer)
 
 
     @classmethod
@@ -215,7 +325,7 @@ class SEI_OT_view3d_stencil_visualizer(bpy.types.Operator):
         return \
         context.area \
         and context.area.type == 'VIEW_3D' \
-        and len(context.scene.collection_sstencils) > 0
+        and has_any_stencil_objects(context.scene)
 
     def execute(self, context):
         if SEI_OT_view3d_stencil_visualizer._handle:
@@ -226,13 +336,13 @@ class SEI_OT_view3d_stencil_visualizer(bpy.types.Operator):
             SEI_OT_view3d_stencil_visualizer._handle = None
 
         else:
-            image = self._setup_image()
+            images = self._setup_images()
             shader = self._setup_shader()
 
             SEI_OT_view3d_stencil_visualizer._handle = \
             bpy.types.SpaceView3D.draw_handler_add(
                 self.draw_stencil,
-                (context, shader, image),
+                (context, shader, images),
                 'WINDOW',
                 'POST_PIXEL'
             )
@@ -244,7 +354,7 @@ class SEI_OT_view3d_stencil_visualizer(bpy.types.Operator):
 class SEI_OT_stencil_render(bpy.types.Operator):
     bl_idname = 'sei.stencil_render'
     bl_label = 'Render Stencil'
-    bl_description = 'Render active scene with the stencil.'
+    bl_description = 'Render active scene with the stencil passes.'
 
     bl_options = {'REGISTER', 'UNDO'}
 
@@ -252,7 +362,7 @@ class SEI_OT_stencil_render(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return len(context.scene.collection_sstencils) > 0
+        return has_any_stencil_objects(context.scene)
 
     def execute(self, context):
         def print_message(message: str="") -> None:
@@ -261,55 +371,29 @@ class SEI_OT_stencil_render(bpy.types.Operator):
 
         #########
         # Initialize values.
-        _saved_nodes = []
-        _saved_attrs_objects = []
         _saved_attrs_render = []
         _saved_attrs_nodes = []
-        _saved_obj_colors = []
 
-        _tmp_filepath = ''
-        _tmp_image = None
+        _tmp_filepaths = {}
+        _tmp_images = {}
 
         scene = context.scene
 
         #########
-        # Gather all stencil objects and set visibility.
-        print_message('Gathering stencil objects.')
+        # Group collections by stencil pass.
+        print_message('Grouping collections by stencil pass.')
 
-        all_stencil_objs = set()
-        for sstencil in scene.collection_sstencils:
-            coll = sstencil.collection
-            if coll is None:
-                continue
-            coll.hide_render = False
-            layer_val = sstencil.layer / 255.0
-            for obj in coll.all_objects:
-                if obj.type == 'MESH' and obj not in all_stencil_objs:
-                    all_stencil_objs.add(obj)
-                    _saved_obj_colors.append((obj, tuple(obj.color)))
-                    obj.color = (layer_val, layer_val, layer_val, 1.0)
+        pass_collections = get_pass_collections(scene)
 
-        if not all_stencil_objs:
-            self.report({'WARNING'}, 'No stencil objects found in collections.')
+        if not pass_collections:
+            self.report({'WARNING'}, 'No collections assigned to stencil passes.')
             return {'FINISHED'}
 
         #########
-        # Get and hide non stencil objects attributes.
-        print_message('Get and hide non stencil objects.')
-
-        for obj in scene.objects:
-            if obj.type == 'CAMERA' \
-            or obj.hide_render is True \
-            or obj in all_stencil_objs:
-                continue
-
-            # Save and set.
-            _saved_attrs_objects.append((obj, obj.hide_render))
-            obj.hide_render = True
-
-        #########
-        # Get the image nodes.
+        # Get the image nodes for each pass.
         print_message('Get the image nodes.')
+
+        pass_nodes = {}  # pass_idx -> [nodes]
 
         # TODO: Only get scene materials.
         for mat in bpy.data.materials:
@@ -326,24 +410,24 @@ class SEI_OT_stencil_render(bpy.types.Operator):
                         stack.append(node.node_tree)
 
                     elif node.type == 'TEX_IMAGE' \
-                    and node.image \
-                    and node.image.name == IMAGE_NAME:
-                        _saved_nodes.append(node)
+                    and node.image:
+                        for pass_idx in pass_collections:
+                            if node.image.name == get_image_name(pass_idx):
+                                if pass_idx not in pass_nodes:
+                                    pass_nodes[pass_idx] = []
+                                pass_nodes[pass_idx].append(node)
 
-        if not _saved_nodes:
-            self.report({'WARNING'}, f'No nodes were found with the image named "{IMAGE_NAME}".')
+        if not pass_nodes:
+            self.report({'WARNING'},
+                f'No nodes were found with images named "{IMAGE_NAME_PREFIX}_*".')
+            return {'FINISHED'}
 
-            # Restore the attributes.
-            for sstencil in scene.collection_sstencils:
-                if sstencil.collection:
-                    sstencil.collection.hide_render = True
+        # Only render passes that have both collections AND image nodes.
+        active_passes = sorted(set(pass_collections.keys()) & set(pass_nodes.keys()))
 
-            for obj, value in _saved_attrs_objects:
-                obj.hide_render = value
-
-            for obj, color in _saved_obj_colors:
-                obj.color = color
-
+        if not active_passes:
+            self.report({'WARNING'},
+                'No stencil passes have both collections and image nodes assigned.')
             return {'FINISHED'}
 
         #########
@@ -358,9 +442,6 @@ class SEI_OT_stencil_render(bpy.types.Operator):
 
         directory, filename = os.path.split(org_filepath)
         # name, extension = os.path.splitext(filename)
-
-        _tmp_filepath = os.path.join(directory, '_tmp_sstencil') + os.sep
-        os.makedirs(_tmp_filepath, exist_ok=True)
 
         del org_filepath
 
@@ -380,14 +461,13 @@ class SEI_OT_stencil_render(bpy.types.Operator):
             (scene.render, 'use_render_cache', False),
             (scene.render, 'use_overwrite', True),
             (scene.render, 'use_placeholder', False),
-            (scene.render, 'filepath', _tmp_filepath),
 
             (scene.display, 'render_aa', '8'),
 
             (scene.grease_pencil_settings, 'antialias_threshold', 1.0),
 
             (scene.display.shading, 'light', 'FLAT'),
-            (scene.display.shading, 'color_type', 'OBJECT'),
+            (scene.display.shading, 'color_type', 'VERTEX'),
             (scene.display.shading, 'show_backface_culling', False),
             (scene.display.shading, 'show_xray', False),
             (scene.display.shading, 'show_shadows', False),
@@ -418,28 +498,67 @@ class SEI_OT_stencil_render(bpy.types.Operator):
 
         del attrs_render
 
-        #########
-        # Render (stencil images).
-        print_message('Rendering the stencil images.')
-
-        if self.render_image:
-            bpy.ops.render.render(write_still=True, use_viewport=True)
-        else:
-            bpy.ops.render.render(animation=True, use_viewport=True)
+        # Save filepath separately since it changes per pass.
+        _saved_filepath = scene.render.filepath
 
         #########
-        # Restore the attributes.
+        # Render stencil images for each active pass.
+        for pass_idx in active_passes:
+            collections = pass_collections[pass_idx]
+            print_message(f'Rendering stencil pass {pass_idx}.')
+
+            # Unhide the collections for this pass.
+            saved_coll_hide = []
+            for coll in collections:
+                saved_coll_hide.append((coll, coll.hide_render))
+                # TODO: Return if collection_layer.exclude.
+                coll.hide_render = False
+
+            # Get the set of object names in this pass's collections.
+            pass_obj_names = set()
+            for coll in collections:
+                for obj in coll.all_objects:
+                    pass_obj_names.add(obj.name)
+
+            # Get and hide non stencil objects for this pass.
+            saved_obj_hide = []
+            for obj in scene.objects:
+                if obj.type == 'CAMERA' \
+                or obj.hide_render is True \
+                or obj.name in pass_obj_names:
+                    continue
+
+                # Save and set.
+                saved_obj_hide.append((obj, obj.hide_render))
+                obj.hide_render = True
+
+            # Set filepath for this pass.
+            _tmp_filepath = os.path.join(
+                directory, f'_tmp_sstencil_{pass_idx}') + os.sep
+            os.makedirs(_tmp_filepath, exist_ok=True)
+            scene.render.filepath = _tmp_filepath
+            _tmp_filepaths[pass_idx] = _tmp_filepath
+
+            # Render (stencil images).
+            print_message(f'Rendering the stencil images for pass {pass_idx}.')
+
+            if self.render_image:
+                bpy.ops.render.render(write_still=True, use_viewport=True)
+            else:
+                bpy.ops.render.render(animation=True, use_viewport=True)
+
+            # Restore visibility for this pass.
+            for coll, value in saved_coll_hide:
+                coll.hide_render = value
+
+            for obj, value in saved_obj_hide:
+                obj.hide_render = value
+
+        #########
+        # Restore the render attributes.
         print_message('Restoring the attributes.')
 
-        for sstencil in scene.collection_sstencils:
-            if sstencil.collection:
-                sstencil.collection.hide_render = True
-
-        for obj, value in _saved_attrs_objects:
-            obj.hide_render = value
-
-        for obj, color in _saved_obj_colors:
-            obj.color = color
+        scene.render.filepath = _saved_filepath
 
         # NOTE: reversed() restores dependant attributes
         # (e.g., PNG vs. OPEN_EXR) in the correct order.
@@ -448,43 +567,45 @@ class SEI_OT_stencil_render(bpy.types.Operator):
                 setattr(obj, attr, value)
 
         #########
-        # Set the image sequence.
-        print_message('Setting the image sequence to the image nodes.')
+        # Set the image sequences to the image nodes.
+        print_message('Setting the image sequences to the image nodes.')
 
-        attrs_nodes = []
+        for pass_idx in active_passes:
+            _tmp_filepath = _tmp_filepaths[pass_idx]
+            nodes = pass_nodes[pass_idx]
 
-        stencil_frames = os.listdir(_tmp_filepath)
-        stencil_frames_length = len(stencil_frames)
+            stencil_frames = os.listdir(_tmp_filepath)
+            stencil_frames_length = len(stencil_frames)
 
-        node_filepath = os.path.join(_tmp_filepath, sorted(stencil_frames)[0])
+            node_filepath = os.path.join(
+                _tmp_filepath, sorted(stencil_frames)[0])
 
-        _tmp_image = bpy.data.images.load(node_filepath)
+            _tmp_image = bpy.data.images.load(node_filepath)
+            _tmp_images[pass_idx] = _tmp_image
 
-        for node in _saved_nodes:
-            # Save and set.
-            if hasattr(node, 'image'):
-                _saved_attrs_nodes.append((node, 'image', node.image))
-                node.image = _tmp_image
+            for node in nodes:
+                # Save and set.
+                if hasattr(node, 'image'):
+                    _saved_attrs_nodes.append((node, 'image', node.image))
+                    node.image = _tmp_image
 
-            if self.render_image:
-                continue
+                if self.render_image:
+                    continue
 
-            attrs_nodes = [
-                (node.image.colorspace_settings, 'name', 'Non-Color'),
+                attrs_nodes = [
+                    (node.image.colorspace_settings, 'name', 'Non-Color'),
 
-                (node.image, 'source', 'SEQUENCE'),
+                    (node.image, 'source', 'SEQUENCE'),
 
-                (node.image_user, 'frame_duration', stencil_frames_length),
-                (node.image_user, 'frame_start', scene.frame_start),
-                (node.image_user, 'frame_offset', scene.frame_start - 1)
-            ]
+                    (node.image_user, 'frame_duration', stencil_frames_length),
+                    (node.image_user, 'frame_start', scene.frame_start),
+                    (node.image_user, 'frame_offset', scene.frame_start - 1)
+                ]
 
-            # Set.
-            for obj, attr, value in attrs_nodes:
-                if hasattr(obj, attr):
-                    setattr(obj, attr, value)
-
-        del attrs_nodes, stencil_frames, stencil_frames_length, node_filepath
+                # Set.
+                for obj, attr, value in attrs_nodes:
+                    if hasattr(obj, attr):
+                        setattr(obj, attr, value)
 
         #########
         # Render (normally).
@@ -508,15 +629,17 @@ class SEI_OT_stencil_render(bpy.types.Operator):
         # Delete the temporary files.
         print_message('Deleting the temporary files.')
 
-        bpy.data.images.remove(_tmp_image)
+        for pass_idx, tmp_image in _tmp_images.items():
+            bpy.data.images.remove(tmp_image)
 
-        for file in os.listdir(_tmp_filepath):
-            filepath = os.path.join(_tmp_filepath, file)
+        for pass_idx, _tmp_filepath in _tmp_filepaths.items():
+            for file in os.listdir(_tmp_filepath):
+                filepath = os.path.join(_tmp_filepath, file)
 
-            if os.path.isfile(filepath):
-                os.remove(filepath)
+                if os.path.isfile(filepath):
+                    os.remove(filepath)
 
-        os.rmdir(_tmp_filepath)
+            os.rmdir(_tmp_filepath)
 
         ###
 
@@ -545,23 +668,24 @@ class SEI_PT_stencil(bpy.types.Panel):
         layout.use_property_split = True
         layout.use_property_decorate = False  # No animation.
 
-        col = layout.column()
-        
-        # UIList for stencil collections
-        row = col.row()
+        scene = context.scene
+
+        # Collection list with add/remove buttons.
+        row = layout.row()
         row.template_list(
-            'SEI_UL_stencil_collections',
-            'stencil_collections',
-            context.scene,
-            'collection_sstencils',
-            context.scene,
-            'active_sstencil_index'
+            'SEI_UL_stencil_collections', '',
+            scene, 'stencil_collections',
+            scene, 'stencil_collections_active_index',
+            rows=3
         )
-        
-        col_buttons = row.column(align=True)
-        col_buttons.operator('sei.stencil_collection_add', icon='ADD', text='')
-        col_buttons.operator('sei.stencil_collection_remove', icon='REMOVE', text='')
-        
+
+        col = row.column(align=True)
+        col.operator('sei.stencil_collection_add', icon='ADD', text='')
+        col.operator('sei.stencil_collection_remove', icon='REMOVE', text='')
+
+        layout.separator()
+
+        col = layout.column()
         col.operator(
             'sei.view3d_stencil_visualizer',
             text = 'Visualize',
@@ -584,9 +708,9 @@ class SEI_PT_stencil(bpy.types.Panel):
 
 classes = [
     SEI_PG_stencil_collection,
+    SEI_UL_stencil_collections,
     SEI_OT_stencil_collection_add,
     SEI_OT_stencil_collection_remove,
-    SEI_UL_stencil_collections,
     SEI_OT_view3d_stencil_visualizer,
     SEI_OT_stencil_render,
     SEI_PT_stencil
@@ -596,23 +720,22 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
 
-    bpy.types.Scene.collection_sstencils = bpy.props.CollectionProperty(
-        type=SEI_PG_stencil_collection,
-        name='Stencil Collections'
+    bpy.types.Scene.stencil_collections = bpy.props.CollectionProperty(
+        type = SEI_PG_stencil_collection,
+        name = 'Stencil Collections',
+        description = 'Collections assigned to stencil passes'
     )
-    
-    bpy.types.Scene.active_sstencil_index = bpy.props.IntProperty(
-        default=0,
-        min=0,
-        name='Active Stencil Index'
+    bpy.types.Scene.stencil_collections_active_index = bpy.props.IntProperty(
+        name = 'Active Stencil Collection Index',
+        default = 0
     )
 
 def unregister():
     for cls in classes:
         bpy.utils.unregister_class(cls)
 
-    del bpy.types.Scene.collection_sstencils
-    del bpy.types.Scene.active_sstencil_index
+    del bpy.types.Scene.stencil_collections
+    del bpy.types.Scene.stencil_collections_active_index
 
 if __name__ == "__main__": # debug; live edit
     register()
